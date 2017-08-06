@@ -1,0 +1,289 @@
+---
+title: "Capstone-Milestone"
+author: "Jesse Holling"
+date: "August 6, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+# Summary
+This John Hopkins Data Science Capstone Milestone project explores a very large (1.3 GB) captured text data set/corpus containing "blogs", "news" and twitter" which is provided by Swiftkey. The U.S. portion (556 MB) of this text data set/corpus will be analyzed and processed into several word combinations (i.e. ngrams) that will used in a later predictive model application for predicting the next word based on typed input.
+
+Project steps involved: 
+
+* Load the Swiftkey large U.S. text based data sets (blog, news, twitter)
+* Explore the text contents and distribution of the data sizes, sentences and words
+* Clean the text data set by removing punctuations, symbols, numbers, URLs, twitter names & profanity
+* Process the texts into various 1, 2, 3, and 4 word combinations (unigram, bigram, trigram, and quadgram respectively)
+* Explore the processed ngrams that will be used in the predictive model
+
+After this milestone project, these derived ngrams & their frequencies will use the "Stupid Backoff" predictive word method to predict "the next word" in a given word combination. This "Stupid Backoff" technique provides a simple, accurate & fast prediction method on large ngrams sets and implements "smoothing" for added accuracy. (see appendix for Stupid Backoff details.)
+
+Lastly, I will implement these newly created ngrams together with my predictive model in an interactive Shiny app which will demonstrate predicting the next word based on input from the user.
+
+
+```{r load U.S. text files, echo=F}
+start <- proc.time() #starting the process clock
+
+library(readr)    #for reading text files
+library(quanteda) #for ngram processing and dfm file format 
+library(stringi)  #for string manipulations & statistics
+library(magrittr) #for forwards piping support
+library(ggplot2)  #for plotting
+
+set.seed(123)
+options(scipen = 999)
+
+blogs <- read_lines("./final/en_US/en_US.blogs.txt") 
+news <- read_lines("./final/en_US/en_US.news.txt") 
+tweets <- read_lines("./final/en_US/en_us.twitter.txt") #tweets seems more appropriate
+
+badwords <- as.character(read_csv("./final/swearWords.csv", col_names = FALSE))
+```
+## Load Data
+To begin, I load the three US data text files: "blogs", "news" and "twitter" (which I call "tweets") in their entirety.
+I then load a previously retrieved list of profanity words which wil be removed from the data.
+
+## Explore Data
+The tables below shows that the three text sources are a little different from each other in their structure with the maximum sentence length (blogs are the longest), average words per sentence (blogs have the highest) and total documents (tweets have the most.)
+
+```{r explore texts data set, echo=F, results='asis'}
+
+#word mean/max stats
+words_summary <- data.frame(cbind(summary(stri_count_words(blogs)), 
+                                  summary(stri_count_words(news)), 
+                                  summary(stri_count_words(tweets))))
+colnames(words_summary) <- c("blogs","news","tweets")
+knitr::kable(words_summary,caption = "Statitics of words per line")
+
+total_words <- data.frame(cbind(sum(stri_count_words(blogs)),
+                                sum(stri_count_words(news)),
+                                sum(stri_count_words(tweets))))
+colnames(total_words) <- c("blogs","news","tweets")
+knitr::kable(total_words,caption = "Total word count")
+
+#total lines & characters                          
+lines_chars <- data.frame(rbind(stri_stats_general(blogs),
+                                stri_stats_general(news),
+                                stri_stats_general(tweets)))
+rownames(lines_chars) <- c("blogs","news","tweets")
+knitr::kable(lines_chars,caption = "Total lines & characters")
+
+```
+
+Due to the differences shown in the tables above, a combining of all three sources will help balance them. 
+
+As to prepare for the ngrams/word combinations, a "training" data set of 65% and will be split from the original U.S. texts & processed into the various ngrams. These processed ngrams will be used to train the predictive model. Likewise, the remaining 35% of the orignal U.S. texts will be used to "test" and/or "validate" that predictive model.
+
+```{r train data, echo=F}
+
+train.blogs = sample(blogs, 0.65*length(blogs))
+train.news = sample(news, 0.65*length(news)) 
+train.tweets = sample(tweets, 0.65*length(tweets)) 
+
+train_lines_chars <- data.frame(rbind(stri_stats_general(train.blogs),
+                                stri_stats_general(train.news),
+                                stri_stats_general(train.tweets)))
+rownames(train_lines_chars) <- c("blogs","news","tweets")
+knitr::kable(train_lines_chars,caption = "Training Sample Total lines & characters")
+
+rm(blogs,news,tweets)
+```
+
+
+## Clean & Process Data
+Processing the majority of the U.S. text data set is very computer memory constrained, even for a modern computer with 16 gig memory. However, using the large percentage of the text data will help with word prediction accuracy while keeping in mind the extra ngram processing time required.
+
+### Processing Details & Functions
+To accomplish this task, I wrote a function that consists of splitting each text source (i.e. blogs, news, tweets) into smaller chunks as to not overload memory during ngram creation. This function calls the Quanteda's package to process ngrams, remove symbols, numbers, URL web addresses, punctution marks and bad words. 
+
+The resulting "cleaned & processed" ngram chunks are recombined, three at a time. Next a "trim" is applied to these big chunks which only keeps ngrams that are in more than one document (i.e. sparsity=99% of ngrams) and have more than two occurances. Afterwards, all these bigger chunks (up to four sets) are combined once again to make one big clean & trimmed ngram file per source. Next, all three sources are combined. 
+Lastly, the newly processed ngrams/word combos from unigram, bigram, trigram, and quadgram, are copied to character data files along with their Frequency/Occurance. These much smaller files are saved and reloaded for exploring & plotting.
+
+For more details, see code link at bottom of this document.
+
+```{r Ngram processing functions, echo=F}
+
+########### cleans, ngrams, removes badwords & converts to dfm data file
+cleanNgram <- function(text,n){
+ngram <- text %>% 
+         tokens(ngrams = n, 
+                   remove_punct = T, 
+                   remove_numbers = T, 
+                   remove_symbols = T, 
+                   remove_twitter = T, 
+                   remove_url = T) %>%
+          tokens_remove(features = badwords, valuetype = "fixed") %>%
+          dfm()     
+ return(ngram)    
+}
+                  
+#### splits text into chunks, combines 3 processed, trims, & combines all chunks together
+Chunker <- function(text,n, Chunks, min_freq_count) {
+total_size <- stri_stats_general(text)[1]
+chunk_size = total_size/Chunks 
+chunk_counter = 0
+text.chunk = NULL; sub_total = NULL; running_total = NULL
+gc()
+
+for (tchunk in 1:(Chunks/3)) 
+{
+    for (nchunk in 1:3) 
+    {
+     chunk_counter = chunk_counter + 1
+     ifelse(chunk_counter == Chunks,
+        text.chunk <- corpus(text[((chunk_counter - 1)*chunk_size + 1):total_size]), 
+        text.chunk <- corpus(text[((chunk_counter - 1)*chunk_size + 1):(chunk_counter * chunk_size)]))
+     text.chunk <- cleanNgram(text.chunk,n)
+     ifelse(nchunk == 1,
+        sub_total <- text.chunk,
+        sub_total <- rbind(sub_total,text.chunk))
+     gc()
+     text.chunk = NULL
+    }
+    sub_total <- dfm_trim(sub_total, min_docfreq = 2, min_count = min_freq_count)
+    ifelse(tchunk == 1,
+        running_total <- sub_total,
+        running_total <- rbind(running_total,sub_total))
+}
+running_total <- dfm_compress(running_total)
+gc()
+return(running_total)
+}
+```
+
+## Exploring Processed Ngrams
+
+```{r ngram processing, echo=F, fig.height= 3.75}
+
+########## unigram ##########
+# note: piping was very helpful with memory since 1 call ran with only 1 output
+
+ngram = 1; chunks = 6; min_freq_count = 3 #3 must divide into chunks evenly
+
+unigrams.top <- rbind(Chunker(train.blogs,ngram, chunks, min_freq_count), 
+                      Chunker(train.news,ngram, chunks, min_freq_count), 
+                      Chunker(train.tweets,ngram, chunks, min_freq_count)) %>%
+                topfeatures(n = Inf)
+
+unigrams <- data.frame(Words = as.character(names(unigrams.top)), 
+                       Frequency = unigrams.top, row.names = NULL) 
+
+write.csv(unigrams, file = "./unigrams.csv", row.names = F) 
+unigrams <- read.csv("./unigrams.csv", stringsAsFactors = F)
+
+unigram_count <- dim(unigrams[1]) 
+
+ggplot(unigrams[1:12,], aes(x = Words, y = Frequency)) +
+    geom_bar(stat = "identity", fill = "blue") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    labs(title = "Most Common Unigrams - Swiftkey U.S. texts")
+
+############ bigram ###########
+ngram = 2; chunks = 12; min_freq_count = 3 #3 must divide into chunks evenly
+
+bigrams.top <- rbind(Chunker(train.blogs,ngram, chunks, min_freq_count), 
+                     Chunker(train.news,ngram, chunks, min_freq_count), 
+                     Chunker(train.tweets,ngram, chunks, min_freq_count)) %>%
+               topfeatures(n = Inf)
+
+bigrams <- data.frame(Word_Combo = as.character(names(bigrams.top)), 
+                      Frequency = bigrams.top, row.names = NULL) 
+
+write.csv(bigrams, file = "./bigrams.csv", row.names = F) 
+bigrams <- read.csv("./bigrams.csv", stringsAsFactors = F)
+
+bigram_count <- dim(bigrams[1]) 
+
+ggplot(bigrams[1:12,], aes(x = Word_Combo, y = Frequency)) +
+    geom_bar(stat = "identity", fill = "red") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    labs(title = "Most Common Bigrams - Swiftkey U.S. texts")
+
+
+############ 3ngram ##########
+ngram = 3; chunks = 12; min_freq_count = 3 #3 must divide into chunks evenly
+
+trigrams.top <- rbind(Chunker(train.blogs,ngram, chunks, min_freq_count), 
+                      Chunker(train.news,ngram, chunks, min_freq_count), 
+                      Chunker(train.tweets,ngram, chunks, min_freq_count)) %>%
+                topfeatures(n = Inf)
+
+trigrams <- data.frame(Word_Combo = as.character(names(trigrams.top)), 
+                       Frequency = trigrams.top, row.names = NULL) 
+
+write.csv(trigrams, file = "./trigrams.csv", row.names = F) 
+trigrams <- read.csv("./trigrams.csv", stringsAsFactors = F) 
+
+trigram_count <- dim(trigrams)[1]
+
+ggplot(trigrams[1:12,], aes(x = Word_Combo, y = Frequency)) +
+    geom_bar(stat = "identity", fill = "yellow") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    labs(title = "Most Common Trigrams - Swiftkey texts")
+
+
+########### 4 gram ##########
+ngram = 4; chunks = 12; min_freq_count = 3 #3 must divide into chunks evenly
+
+quadrams.top <- rbind(Chunker(train.blogs,ngram, chunks, min_freq_count), 
+                      Chunker(train.news,ngram, chunks, min_freq_count), 
+                      Chunker(train.tweets,ngram, chunks, min_freq_count)) %>%
+                topfeatures(n = Inf)
+
+quadgrams <- data.frame(Word_Combo = as.character(names(quadrams.top)), 
+                        Frequency = quadrams.top, row.names = NULL) 
+write.csv(quadgrams, file = "./quadgrams.csv", row.names = F) 
+quadgrams <- read.csv("./quadgrams.csv", stringsAsFactors = F)
+
+quadgram_count <- dim(quadgrams)[1]
+
+ggplot(quadgrams[1:12,], aes(x = Word_Combo, y = Frequency)) +
+    geom_bar(stat = "identity", fill = "green") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    labs(title = "Most Common Quadgrams - Swiftkey U.S. texts")
+
+
+
+time <- proc.time() - start
+```
+
+All of the top 12 most common ngram/word combinations for unigram, bigram, trigram & Quadgram on the "train" sample are very common, as can be seen.
+
+###Total Ngram Count
+
+Unigram = **`r unigram_count[1]`** unique single words
+
+Bigram  = **`r bigram_count[1]`** unique two word combinations
+
+Trigram = **`r trigram_count[1]`** unique three word combinations
+
+Quadgram = **`r quadgram_count[1]`** unique four word combinations
+
+
+The large counts of these ngrams will be appropriate for the "Stupid Backoff" predictive model. However, the Bigram & Trigram at over 700K ngrams, could be limited down if needing to have smaller files for a server or for a faster ngram lookup.
+
+Total time to run & process ngrams:
+**`r time[1]`** Seconds on 4 core 8 gig memory 1.6 ghz machine
+
+Capstone Milestone Code that ran this project
+[github code link](https://github.com/JHolling/JH-Capstone)
+
+##References
+
+Coursera. (2014). SwifKey Text Dataset [Data file]. Retrieved from
+https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip.
+
+Manning, C. D., Raghavan, P., & Schutze, H. (2008). Introduction to Information Retrieval. Cambridge University Press
+https://nlp.stanford.edu/IR-book/html/htmledition/inverse-document-frequency-1.html
+
+Profanity list
+"http://www.bannedwordlist.com/lists/swearWords.csv"
+
+Stupid Backoff review
+http://www.aclweb.org/anthology/D07-1090.pdf
+
